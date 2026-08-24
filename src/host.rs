@@ -75,6 +75,7 @@ pub(crate) mod pulseaudio;
 
 #[cfg(windows)]
 pub(crate) mod wasapi;
+pub(crate) mod wasapi_new;
 
 #[cfg(all(
     target_arch = "wasm32",
