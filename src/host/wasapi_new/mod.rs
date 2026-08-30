@@ -10,7 +10,7 @@ impl HostTrait for Host {
 	type Device = Device;
 
 	fn is_available() -> bool {
-		todo!()
+		true
 	}
 
 	fn devices(&self) -> Result<Self::Devices, crate::Error> {
