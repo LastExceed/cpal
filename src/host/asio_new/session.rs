@@ -48,11 +48,11 @@ impl Factory {
 
 #[derive(Debug)]
 pub struct Session {
-    pub driver       : Driver,
-    init_success     : bool,
-    clsid_string     : String,
+    pub driver: Driver,
+    init_success: bool,
+    clsid_string: String,
     pub stream_exists: Mutex<bool>,
-    _com_worker      : com::worker::Handle
+    _com_worker: com::worker::Handle,
 }
 
 impl Session {
@@ -70,11 +70,7 @@ impl Session {
     }
 
     pub fn id(&self) -> CpalResult<DeviceId> {
-        DeviceId::new(
-            HostId::AsioNew,
-            self.clsid_string.clone()
-        )
-        .pipe(Ok)
+        DeviceId::new(HostId::AsioNew, self.clsid_string.clone()).pipe(Ok)
     }
 
     pub fn description(&self) -> CpalResult<DeviceDescription> {
@@ -83,20 +79,22 @@ impl Session {
 
         let direction = match capabilities::channel_counts(&self.driver)? {
             ChannelCounts { in_: 1.., out: 1.. } => DeviceDirection::Duplex,
-            ChannelCounts { in_: 1.., out: 0   } => DeviceDirection::Input,
-            ChannelCounts { in_: 0  , out: 1.. } => DeviceDirection::Output,
-            _                                    => DeviceDirection::Unknown,
+            ChannelCounts { in_: 1.., out: 0 } => DeviceDirection::Input,
+            ChannelCounts { in_: 0, out: 1.. } => DeviceDirection::Output,
+            _ => DeviceDirection::Unknown,
         };
 
         let mut extended = vec![format!("driver version: {}", self.driver.version())];
 
         if !self.init_success {
             extended.push("ASIO driver failed to initialize".to_owned()); // ASIO drivers can often still do *something* when they fail to initialize
-            extended.push(format!("last error: {}", self.driver.last_error().to_string_lossy()));
+            extended.push(format!(
+                "last error: {}",
+                self.driver.last_error().to_string_lossy()
+            ));
         }
 
-        DeviceDescriptionBuilder
-            ::new(&name)
+        DeviceDescriptionBuilder::new(&name)
             .driver(name)
             .direction(direction)
             .extended(extended)
@@ -110,8 +108,9 @@ impl Session {
             return false;
         }
 
-        let Ok(counts) = self.driver.channel_counts()
-        else { return false; }; // can't do anything if it can't even count the channels
+        let Ok(counts) = self.driver.channel_counts() else {
+            return false;
+        }; // can't do anything if it can't even count the channels
 
         if IN && counts.in_ == 0 {
             return false;
@@ -127,15 +126,20 @@ impl Session {
     pub fn supported_configs<const INPUT: bool>(&self) -> CpalResult<SupportedConfigs> {
         let ch_count = capabilities::channel_count::<INPUT>(&self.driver)?;
         if ch_count == 0 {
-            return err(UnsupportedOperation, "the device has no channels in this direction");
+            return err(
+                UnsupportedOperation,
+                "the device has no channels in this direction",
+            );
         }
 
         let (min_rate, max_rate) = capabilities::sample_rates(&self.driver)?;
-        let buf_size             = capabilities::buffer_size_supported(&self.driver);
-        let sample_formats       = capabilities::sample_formats::<INPUT>(&self.driver, ch_count)?;
+        let buf_size = capabilities::buffer_size_supported(&self.driver);
+        let sample_formats = capabilities::sample_formats::<INPUT>(&self.driver, ch_count)?;
 
         sample_formats
-            .map(move |format| SupportedStreamConfigRange::new(ch_count as _, min_rate, max_rate, buf_size, format))
+            .map(move |format| {
+                SupportedStreamConfigRange::new(ch_count as _, min_rate, max_rate, buf_size, format)
+            })
             .collect::<Vec<_>>()
             .into_iter()
             .pipe(Ok)
@@ -145,42 +149,49 @@ impl Session {
         self.supported_configs::<INPUT>()?
             .next()
             .expect("infallible")
-            .pipe(|range|
+            .pipe(|range| {
                 SupportedStreamConfig::new(
                     range.channels(),
                     range.min_sample_rate(),
                     *range.buffer_size(),
-                    range.sample_format()
+                    range.sample_format(),
                 )
-            )
+            })
             .pipe(Ok)
     }
-	
-	pub fn build_stream(
-        self       : &Arc<Self>,
-        cfg_in     : simplex::Config,
-        cfg_out    : simplex::Config,
+
+    pub fn build_stream(
+        self: &Arc<Self>,
+        cfg_in: simplex::Config,
+        cfg_out: simplex::Config,
         sample_rate: SampleRate,
         buffer_size: BufferSize,
-        data_cb    : data_cb_type!(),
-        error_cb   : error_cb_type!()
+        data_cb: data_cb_type!(),
+        error_cb: error_cb_type!(),
     ) -> CpalResult<super::Stream> {
-        let mut guard = self.stream_exists.lock().or(err(DeviceNotAvailable, "Mutex poisoned. This device is most likely dead"))?;
+        let mut guard = self.stream_exists.lock().or(err(
+            DeviceNotAvailable,
+            "Mutex poisoned. This device is most likely dead",
+        ))?;
         if *guard {
-            return err(UnsupportedOperation, "ASIO only supports 1 stream per device");
+            return err(
+                UnsupportedOperation,
+                "ASIO only supports 1 stream per device",
+            );
         }
-        
+
         self.set_sample_rate(sample_rate)?;
         let frame_count = self.get_frame_count(buffer_size)?;
         let callbacks = self.prepare(cfg_in, cfg_out, frame_count, data_cb, error_cb)?;
-        
+
         *guard = true;
-        
+
         super::Stream {
             session: Arc::clone(self),
             frame_count,
-            _callbacks: callbacks // keep this alive until the stream is dropped
-        }.pipe(Ok)
+            _callbacks: callbacks, // keep this alive until the stream is dropped
+        }
+        .pipe(Ok)
     }
 
     fn set_sample_rate(&self, sample_rate: SampleRate) -> CpalResult<()> {
@@ -198,7 +209,7 @@ impl Session {
     fn get_frame_count(&self, requested: BufferSize) -> CpalResult<FrameCount> {
         match requested {
             BufferSize::Fixed(n) => n,
-            BufferSize::Default  => capabilities::buffer_size_preferred(&self.driver)? as FrameCount,
+            BufferSize::Default => capabilities::buffer_size_preferred(&self.driver)? as FrameCount,
         }
         .pipe(Ok)
     }
@@ -206,12 +217,12 @@ impl Session {
     /// ASIO lifecycle stage 2 ("initialized") -> stage 3 ("prepared")
     /// - See ASIO specification section II.2
     fn prepare(
-        self       : &Arc<Self>,
-        cfg_in     : simplex::Config,
-        cfg_out    : simplex::Config,
+        self: &Arc<Self>,
+        cfg_in: simplex::Config,
+        cfg_out: simplex::Config,
         frame_count: FrameCount,
-        data_cb    : data_cb_type!(),
-        error_cb   : error_cb_type!()
+        data_cb: data_cb_type!(),
+        error_cb: error_cb_type!(),
     ) -> CpalResult<Pin<Box<Callbacks>>> {
         let channel_ids: Vec<_> = [cfg_in, cfg_out]
             .into_iter()
@@ -223,17 +234,21 @@ impl Session {
 
         // SAFETY:
         // `Callbacks` is pinned, and kept alive until after the buffers are disposed (see `Drop` implementation of `Stream`)
-        let mut double_buffers =
-            unsafe { self.driver.create_buffers(channel_ids, frame_count as _, callbacks.pointers()) }
-            .map_err(|error| create_report(&self.driver, error, "create_buffers"))?
-            .map(DoubleBuffer);
+        let mut double_buffers = unsafe {
+            self.driver
+                .create_buffers(channel_ids, frame_count as _, callbacks.pointers())
+        }
+        .map_err(|error| create_report(&self.driver, error, "create_buffers"))?
+        .map(DoubleBuffer);
 
-        let buffers_in  = double_buffers.by_ref().take(cfg_in.channels as _).collect();
+        let buffers_in = double_buffers.by_ref().take(cfg_in.channels as _).collect();
         let buffers_out = double_buffers.collect();
-        let simplex_in  = simplex::WithScratch::new(cfg_in .format, frame_count, buffers_in );
+        let simplex_in = simplex::WithScratch::new(cfg_in.format, frame_count, buffers_in);
         let simplex_out = simplex::WithScratch::new(cfg_out.format, frame_count, buffers_out);
 
-        callbacks.as_mut().prime(Arc::clone(self), data_cb, error_cb, simplex_in, simplex_out);
+        callbacks
+            .as_mut()
+            .prime(Arc::clone(self), data_cb, error_cb, simplex_in, simplex_out);
 
         Ok(callbacks)
     }

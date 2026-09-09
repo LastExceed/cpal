@@ -5,26 +5,28 @@ use std::{ptr, slice};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Config {
-    pub format  : SampleFormat,
+    pub format: SampleFormat,
     pub channels: u16,
-    pub input   : bool,
+    pub input: bool,
 }
 
 impl Config {
     pub fn validate(self, driver: &Driver) -> impl Iterator<Item = CpalResult<ChannelId>> {
-        (0..self.channels)
-            .map(move |i| {
-                let id = ChannelId { input: self.input, index: i as _ };
-                let actual_format = driver
-                    .channel_info(id)
-                    .map_err(|error| create_report(driver, error, "channel_info"))?
-                    .sample_type
-                    .pipe(sample_format_asio2cpal);
-                if actual_format != Some(self.format) {
-                    return err(UnsupportedConfig, "Sample format mismatch");
-                }
-                Ok(id)
-            })
+        (0..self.channels).map(move |i| {
+            let id = ChannelId {
+                input: self.input,
+                index: i as _,
+            };
+            let actual_format = driver
+                .channel_info(id)
+                .map_err(|error| create_report(driver, error, "channel_info"))?
+                .sample_type
+                .pipe(sample_format_asio2cpal);
+            if actual_format != Some(self.format) {
+                return err(UnsupportedConfig, "Sample format mismatch");
+            }
+            Ok(id)
+        })
     }
 }
 
@@ -32,7 +34,7 @@ impl Config {
 pub struct Head {
     pub format: SampleFormat,
     pub frame_count: FrameCount,
-    pub buf_ptrs: Vec<DoubleBuffer>
+    pub buf_ptrs: Vec<DoubleBuffer>,
 }
 
 impl Head {
@@ -65,9 +67,7 @@ impl Head {
     }
 
     fn get_buf_ptr(&self, channel: usize, dbuf_side: usize) -> *mut u8 {
-        self.buf_ptrs[channel]
-            .0[dbuf_side]
-            .cast()
+        self.buf_ptrs[channel].0[dbuf_side].cast()
     }
 
     fn get_buf<'buf>(&self, channel: usize, dbuf_side: usize) -> &'buf [u8] {
@@ -85,32 +85,34 @@ impl Head {
 
 pub struct WithScratch {
     head: Head,
-    scratch: Box<[u8]>
+    scratch: Box<[u8]>,
 }
 
 impl WithScratch {
     pub fn new(format: SampleFormat, frame_count: FrameCount, buf_ptrs: Vec<DoubleBuffer>) -> Self {
-        let head = Head { format, frame_count, buf_ptrs };
+        let head = Head {
+            format,
+            frame_count,
+            buf_ptrs,
+        };
 
         // when the stream is mono, the ASIO buffer can be exposed to the user callback directly
-        let scratch_len = if head.channel_count() == 1 { 0 } else { head.total_buffer_space() };
+        let scratch_len = if head.channel_count() == 1 {
+            0
+        } else {
+            head.total_buffer_space()
+        };
         let scratch = vec![0; scratch_len].into_boxed_slice();
         Self { head, scratch }
     }
 
     pub fn data(&mut self, dbuf_side: usize) -> Data {
         let ptr = match self.head.channel_count() {
-            0   => ptr::null_mut(),
-            1   => self.head.get_buf_ptr(0, dbuf_side).cast(),
-            2.. => self.scratch.as_mut_ptr().cast()
+            0 => ptr::null_mut(),
+            1 => self.head.get_buf_ptr(0, dbuf_side).cast(),
+            2.. => self.scratch.as_mut_ptr().cast(),
         };
-        unsafe {
-            Data::from_parts(
-                ptr,
-                self.head.sample_count(),
-                self.head.format
-            )
-        }
+        unsafe { Data::from_parts(ptr, self.head.sample_count(), self.head.format) }
     }
 
     /// copies channel data to the scratch buffer, interleaving it in the process
@@ -119,18 +121,16 @@ impl WithScratch {
             // When the simplex is mono, the ASIO buffers are exposed directly
             return;
         }
-        
+
         let stride = self.head.sample_size();
         let scratch_frames = self
             .scratch
             .chunks_exact_mut(self.head.channel_count() * stride);
-        
+
         for (i_frame, scratch_frame) in scratch_frames.enumerate() {
             for (i_channel, scratch_sample) in scratch_frame.chunks_exact_mut(stride).enumerate() {
                 let pos = i_frame * stride;
-                self.head
-                    .get_buf(i_channel, dbuf_side)
-                    [pos..][..stride]
+                self.head.get_buf(i_channel, dbuf_side)[pos..][..stride]
                     .pipe_ref(|slice| scratch_sample.copy_from_slice(slice));
             }
         }
@@ -141,18 +141,16 @@ impl WithScratch {
             // When the simplex is mono, the ASIO buffers are exposed directly
             return;
         }
-        
+
         let stride = self.head.sample_size();
         let scratch_frames = self
             .scratch
             .chunks_exact(self.head.channel_count() * stride);
-        
+
         for (i_frame, scratch_frame) in scratch_frames.enumerate() {
             for (i_channel, scratch_sample) in scratch_frame.chunks_exact(stride).enumerate() {
                 let pos = i_frame * stride;
-                self.head
-                    .get_buf_mut(i_channel, dbuf_side)
-                    [pos..][..stride]
+                self.head.get_buf_mut(i_channel, dbuf_side)[pos..][..stride]
                     .copy_from_slice(scratch_sample);
             }
         }
