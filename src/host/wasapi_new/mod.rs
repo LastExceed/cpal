@@ -1,9 +1,12 @@
-use std::fmt::Display;
-use std::hash::Hash;
-use std::thread;
+use std::fmt::{self, Display};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::{thread, vec};
+use std::time::Duration;
 
 use tap::Pipe;
 use windows::Devices::Enumeration::DeviceInformation;
+use windows::Win32::Media::Audio::_AUDCLNT_BUFFERFLAGS;
 
 use crate::ErrorKind::BackendError;
 use crate::*;
@@ -18,7 +21,7 @@ mod utils;
 pub struct Host;
 
 impl Host {
-	pub fn new() -> Result<Self, crate::Error> {
+	pub const fn new() -> Result<Self, crate::Error> {
 		Ok(Self)
 	}
 }
@@ -53,13 +56,13 @@ pub struct Device {
 }
 
 impl Hash for Device {
-	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+	fn hash<H: Hasher>(&self, state: &mut H) {
 		todo!()
 	}
 }
 
 impl Display for Device {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		todo!()
 	}
 }
@@ -70,12 +73,12 @@ impl Device {
 		let props       = self.info.Properties()?.pipe(properties::Facade);
 		let name        = self.info.Name()?.to_string_lossy();
 		let direction   = if self.input { DeviceDirection::Input } else { DeviceDirection::Output };
-		let device_type = props.device_type()?;
+		// let device_type = props.device_type()?;
 		
 		let mut builder = DeviceDescriptionBuilder
 			::new(name)
-			.direction(direction)
-			.device_type(device_type);
+			.direction(direction);
+			// .device_type(device_type);
 		
 		if let Some(addr) = props.physical_location()? {
 			builder = builder.address(addr);
@@ -90,8 +93,8 @@ impl Device {
 }
 
 impl DeviceTrait for Device {
-	type SupportedInputConfigs = std::vec::IntoIter<SupportedStreamConfigRange>;
-	type SupportedOutputConfigs = std::vec::IntoIter<SupportedStreamConfigRange>;
+	type SupportedInputConfigs = vec::IntoIter<SupportedStreamConfigRange>;
+	type SupportedOutputConfigs = vec::IntoIter<SupportedStreamConfigRange>;
 	type Stream = Stream;
 
 	fn description(&self) -> Result<DeviceDescription, Error> {		
@@ -123,15 +126,38 @@ impl DeviceTrait for Device {
 		&self,
 		config: StreamConfig,
 		sample_format: SampleFormat,
-		data_callback: D,
+		mut data_callback: D,
 		error_callback: E,
-		timeout: Option<std::time::Duration>,
+		timeout: Option<Duration>,
 	) -> Result<Self::Stream, Error>
 	where
 		D: FnMut(&Data, &CallbackInfo) + Send + 'static,
 		E: FnMut(Error) + Send + 'static
 	{
-		todo!()
+		let path = self.info.Id().context("path")?;
+		let client = Client::activate(&path).context("ac3 activate")?;
+		
+		let (format, period_frames) = client.get_current_shared_mode_engine_period().context("periods")?;
+		client.initialize_shared_audio_stream(period_frames, format.cast_const()).context("init")?;
+		let event = client.set_event_handle().context("set event")?;
+		let total_frame_count = client.get_buffer_size().context("buf size")?;
+		let waitable_stream_state = WaitableStreamState::new().context("signal")?.pipe(Arc::new);
+		let capturer = client.get_capture_client().context("get cap")?;
+		
+		let stream = Stream {
+			client: client.clone(), // COM pointers are essentially arcs
+			total_frame_count,
+			period_frames,
+			state: Arc::clone(&waitable_stream_state)
+		};
+		
+		thread::spawn(move || {
+			while waitable_stream_state.wait_any() != StreamState::Exit {
+				input_processing_loop(&event, &client, sample_format, &mut data_callback, &capturer, &waitable_stream_state);	
+			}
+		});
+		
+		Ok(stream)
 	}
 
 	fn build_output_stream_raw<D, E>(
@@ -140,35 +166,32 @@ impl DeviceTrait for Device {
 		sample_format: SampleFormat,
 		mut data_callback: D,
 		error_callback: E,
-		timeout: Option<std::time::Duration>,
+		timeout: Option<Duration>,
 	) -> Result<Self::Stream, Error>
 	where
 		D: FnMut(&mut Data, &CallbackInfo) + Send + 'static,
 		E: FnMut(Error) + Send + 'static
 	{
-		let path = self.info.Id().unwrap();
+		let path = self.info.Id().context("path")?;
 		let client = Client::activate(&path).context("ac3 activate")?;
 
 		let (format, period_frames) = client.get_current_shared_mode_engine_period().context("periods")?;
 		client.initialize_shared_audio_stream(period_frames, format.cast_const()).context("init")?;
-		let event = client.set_event_handle().unwrap();
+		let event = client.set_event_handle().context("set event")?;
 		let total_frame_count = client.get_buffer_size().context("buf size")?;
-		let signaled_stream_state = SignaledStreamState::new().context("signal")?;
+		let waitable_stream_state = WaitableStreamState::new().context("signal")?.pipe(Arc::new);
 		let renderer = client.get_render_client().context("get render")?;
 		
 		let stream = Stream {
-			client: client.clone(),
-			total_frame_count: 0,
+			client: client.clone(), // COM pointers are essentially arcs
+			total_frame_count,
 			period_frames,
-			stream_state: signaled_stream_state
+			state: Arc::clone(&waitable_stream_state)
 		};
 		
-		// let status = "";
-		
 		thread::spawn(move || {
-			loop {
-				signaled_stream_state.wait_value(StreamState::Running, None).unwrap();
-				processing_loop(event, &client, total_frame_count, sample_format, &mut data_callback, &renderer, &signaled_stream_state);	
+			while waitable_stream_state.wait_any() != StreamState::Exit {
+				output_processing_loop(&event, &client, total_frame_count, sample_format, &mut data_callback, &renderer, &waitable_stream_state);	
 			}
 		});
 		
@@ -176,45 +199,91 @@ impl DeviceTrait for Device {
 	}
 }
 
-fn processing_loop(
-	event: Event,
+fn input_processing_loop(
+	event: &Event,
+	client: &Client,
+	sample_format: SampleFormat,
+	data_callback: &mut (impl FnMut(&Data, &CallbackInfo) + Send + 'static),
+	capturer: &Capturer,
+	waitable_stream_state: &WaitableStreamState
+) {
+	loop {
+		event.wait(None).unwrap();
+		
+		if waitable_stream_state.get() != StreamState::Running {
+			break;
+		}
+		
+		capture(capturer, sample_format, data_callback);
+	}
+	
+	client.stop().unwrap();
+	client.reset().unwrap();
+}
+
+fn output_processing_loop(
+	event: &Event,
 	client: &Client,
 	total_frame_count: u32,
 	sample_format: SampleFormat,
 	data_callback: &mut (impl FnMut(&mut Data, &CallbackInfo) + Send + 'static),
 	renderer: &Renderer,
-	signaled_stream_state: &SignaledStreamState
+	waitable_stream_state: &WaitableStreamState
 ) {
 	loop {
 		event.wait(None).unwrap();
-		let pad = client.get_current_padding().unwrap();
+		let padding = client.get_current_padding().unwrap();
 		
-		match signaled_stream_state.get() {
-			StreamState::Halted => break,
+		use StreamState::*;
+		#[deny(non_snake_case, reason = "prevent accidental wildcard patterns from typos")]
+		match waitable_stream_state.get() {
+			Running => render(total_frame_count - padding, sample_format, data_callback, renderer),
 			
-			StreamState::Draining if pad == 0 => {
-				client.stop().unwrap();
-				signaled_stream_state.set(StreamState::Halted).unwrap();
-				client.reset().unwrap();
+			Draining if padding == 0 => {
+				waitable_stream_state.set(Halted);
 				break;
 			},
 			
-			StreamState::Draining => continue,
+			Draining => (),
 			
-			StreamState::Running => render(total_frame_count - pad, sample_format, data_callback, renderer),
+			Halted | Exit => return,
 		};
 	}
+	
+	client.stop().unwrap();
+	client.reset().unwrap();
+}
+
+fn capture(
+	capturer: &Capturer,
+	sample_format: SampleFormat,
+	data_callback: &mut (impl FnMut(&Data, &CallbackInfo) + Send + 'static),
+) {
+	let fn_capture = |ptr: *mut u8, n_frames: u32, flags: _AUDCLNT_BUFFERFLAGS, dev_pos: u64, qpc_pos: u64| {
+		if n_frames == 0 {
+			return;
+		}
+		let sample_count = n_frames * 2; // todo
+		let data = unsafe { Data::from_parts(ptr.cast(), sample_count as _, sample_format) };
+		let cbi = CallbackInfo {
+			timestamp: StreamTimestamp { callback: StreamInstant::ZERO, device: StreamInstant::ZERO },
+			xrun: false,
+		};
+		
+		data_callback(&data, &cbi);
+	};
+	capturer.with_buffer(fn_capture).unwrap();
 }
 
 fn render(
-	frame_count: u32,
-	sample_format   : SampleFormat,
-	data_callback   : &mut (impl FnMut(&mut Data, &CallbackInfo) + Send + 'static),
-	renderer        : &Renderer
+	frame_count  : u32,
+	sample_format: SampleFormat,
+	data_callback: &mut (impl FnMut(&mut Data, &CallbackInfo) + Send + 'static),
+	renderer     : &Renderer
 ) {
 	let sample_count = frame_count * 2; // todo
 	
-	let func = |ptr: *mut u8| {
+	let fn_render = |ptr: *mut u8| {
 		let mut data = unsafe { Data::from_parts(ptr.cast(), sample_count as _, sample_format) };
 		let cbi = CallbackInfo {
 			timestamp: StreamTimestamp { callback: StreamInstant::ZERO, device: StreamInstant::ZERO },
@@ -224,46 +293,40 @@ fn render(
 		data_callback(&mut data, &cbi);
 		
 		if sample_format == SampleFormat::I24 {
-			shift_up(ptr, sample_count);
+			// shift_up(ptr, sample_count);
 		}
 	};
 	
-	renderer.with_buffer(frame_count, func).unwrap();
+	renderer.with_buffer(frame_count, fn_render).unwrap();
 }
-
-// fn foo(ptr: *mut u8, sample_count: u32, sample_format: SampleFormat) {
-// 	let mut data = unsafe { Data::from_parts(ptr.cast(), sample_count as _, sample_format) };
-// 	let cbi = CallbackInfo {
-// 		timestamp: StreamTimestamp { callback: StreamInstant::ZERO, device: StreamInstant::ZERO },
-// 		xrun: false,
-// 	};
-
-// 	data_callback(&mut data, &cbi);
-	
-// 	if sample_format == SampleFormat::I24 {
-// 		shift_up(ptr, sample_count);
-// 	}
-// }
 
 pub struct Stream {
 	client: Client,
 	total_frame_count: u32,
 	period_frames: u32,
-	stream_state: SignaledStreamState
+	state: Arc<WaitableStreamState>
 }
 
 impl StreamTrait for Stream {
 	fn start(&self) -> Result<(), Error> {
-		self.client.start().context("start")
+		self.state.set(StreamState::Running);
+		self.client.start().context("start")?;
+		Ok(())
 	}
 
 	fn pause(&self) -> Result<(), Error> {
-		self.client.stop().context("stop")
+		self.client.stop().context("stop")?;
+		self.state.set(StreamState::Halted);
+		Ok(())
 	}
 
-	fn stop(&self, _timeout: Option<std::time::Duration>) -> Result<(), Error> {
-		self.client.stop().context("stop")?;
-		self.client.reset().context("reset")
+	fn stop(&self, timeout: Option<Duration>) -> Result<(), Error> {
+		self.state.set(StreamState::Draining);
+		if self.state.wait_value(StreamState::Halted, timeout) {
+			Ok(())
+		} else {
+			todo!("timed out")
+		}
 	}
 
 	fn buffer_size(&self) -> Result<FrameCount, Error> {

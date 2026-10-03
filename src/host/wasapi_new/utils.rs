@@ -1,15 +1,17 @@
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
-use std::{mem, ptr, slice};
+use std::{ptr, slice};
 use std::sync::mpsc;
+use parking_lot::{Condvar, Mutex};
+use rand::{RngExt, rng};
 use tap::Pipe;
 use windows::Win32::Foundation::{E_POINTER, HANDLE, PROPERTYKEY, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::Audio::*;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows_core::{HRESULT, HSTRING, IUnknown, Interface, implement};
 
 pub type WinResult<T> = windows::core::Result<T>;
 
+#[expect(clippy::cast_ptr_alignment, reason = "guaranteed by WASAPI")]
 pub fn shift_up(ptr: *mut u8, sample_count: u32) {
 	let slice = unsafe { slice::from_raw_parts_mut(ptr.cast::<i32>(), sample_count as _) };
 	for sample in slice {
@@ -94,12 +96,13 @@ unsafe impl Send for Event {}
 unsafe impl Sync for Event {}
 
 impl Client {
+	#[expect(clippy::unwrap_in_result, reason = "this would be an OS bug")]
 	pub fn activate(path: &HSTRING) -> WinResult<Self> {
 		let (sender, receiver) = mpsc::channel();
 		let completion_handler: IActivateAudioInterfaceCompletionHandler = ActivateAudioInterfaceCompletionHandler(sender).into();
 		
 		let iid = IAudioClient3::IID;
-		unsafe { ActivateAudioInterfaceAsync(path, &raw const iid, None, &completion_handler)? };
+		unsafe { ActivateAudioInterfaceAsync(path, &raw const iid, None, &completion_handler)?; }
 		
 		receiver
 			.recv()
@@ -118,7 +121,7 @@ impl Client {
 				&raw mut periods.fundamental,
 				&raw mut periods.min,
 				&raw mut periods.max
-			)?
+			)?;
 		};
 		
 		Ok(periods)
@@ -222,7 +225,6 @@ struct CapturePacket {
 
 impl Renderer {
 	pub fn with_buffer(&self, frame_count: u32, func: impl FnOnce(*mut u8)) -> WinResult<()> {
-		println!("{frame_count}");
 		if frame_count == 0 {
 			return Ok(())
 		}
@@ -257,38 +259,54 @@ impl Event {
 pub enum StreamState {
 	Running,
 	Draining,
-	Halted
+	Halted,
+	Exit
 }
 
-pub struct SignaledStreamState {
-	inner: AtomicU8,
-	event: Event,
+pub struct WaitableStreamState {
+	mutex: Mutex<StreamState>,
+	condvar: Condvar
 }
 
-impl SignaledStreamState {
+impl WaitableStreamState {
 	pub fn new() -> WinResult<Self> {
 		Self {
-			inner: AtomicU8::new(StreamState::Halted as _),
-			event: Event::new()?
+			mutex: Mutex::new(StreamState::Halted),
+			condvar: Condvar::new()
 		}.pipe(Ok)
 	}
 	
 	pub fn get(&self) -> StreamState {
-		unsafe { mem::transmute(self.inner.load(Ordering::Relaxed)) }
+		*self.mutex.lock()
 	}
 	
-	pub fn set(&self, value: StreamState) -> WinResult<()> {
-		self.inner.store(value as _, Ordering::Relaxed);
-		unsafe { SetEvent(self.event.0) }
+	pub fn set(&self, value: StreamState) {
+		*self.mutex.lock() = value;
+		self.condvar.notify_all();
 	}
 	
-	pub fn wait_value(&self, value: StreamState, timeout: Option<Duration>) -> WinResult<bool> {
-		while self.get() != value {
-			if !self.event.wait(timeout)? {
-				return Ok(false)
-			}
-		}
+	pub fn wait_any(&self) -> StreamState {
+		self.wait(|_| false, None).unwrap()
+	}
+	
+	pub fn wait_value(&self, value: StreamState, timeout: Option<Duration>) -> bool {
+		self.wait(|state| *state != value, timeout).is_some()
+	}
+	
+	fn wait(&self, condition: impl Fn(&mut StreamState) -> bool, timeout: Option<Duration>) -> Option<StreamState> {
+		let mut guard = self.mutex.lock();
+		
+		if let Some(duration) = timeout {
+			let expired = self.condvar
+				.wait_while_for(&mut guard, condition, duration)
+				.timed_out();
 
-		Ok(true)
+			if expired { return None; }
+		} else {
+			self.condvar
+				.wait_while(&mut guard, condition);
+		}
+		
+		Some(*guard)
 	}
 }

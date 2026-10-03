@@ -1,10 +1,11 @@
 use tap::Pipe;
 use windows::Foundation::IPropertyValue;
 use windows::Win32::Foundation::S_OK;
+use windows::Win32::Media::Audio;
 use windows::Win32::Media::Audio::*;
 use windows_collections::IMapView;
 use windows_core::{Array, HSTRING, IInspectable, Interface, h};
-use crate::{DeviceDescription, DeviceType};
+use crate::DeviceType;
 use super::utils::{WinResult, to_aqs};
 
 const PHYSICAL_DEVICE_LOCATION: &HSTRING = h!("System.Devices.PhysicalDeviceLocation");
@@ -19,20 +20,22 @@ impl Facade {
 			.GetInt32()?
 			.pipe(EndpointFormFactor);
 		
-		#[deny(non_snake_case, reason = "typos would silently turn these into wildcard patterns")]
+		#[deny(nonstandard_style, reason = "typos would silently turn these into wildcard patterns")]
+		#[expect(unused_qualifications, reason = "rustc bug?")]
+		#[expect(clippy::match_same_arms, reason = "happenstance")]
 		match eff {
-			RemoteNetworkDevice       => DeviceType::Unknown,
-			Speakers                  => DeviceType::Speaker,
-			LineLevel                 => DeviceType::Unknown,
-			Headphones                => DeviceType::Headphones,
-			Microphone                => DeviceType::Microphone,
-			Headset                   => DeviceType::Headset,
-			Handset                   => DeviceType::Handset,
-			UnknownDigitalPassthrough => DeviceType::Unknown,
-			SPDIF                     => DeviceType::Unknown,
-			DigitalAudioDisplayDevice => DeviceType::Unknown,
-			UnknownFormFactor         => DeviceType::Unknown,
-			_                         => DeviceType::Unknown
+			Audio::RemoteNetworkDevice       => DeviceType::Unknown,
+			Audio::Speakers                  => DeviceType::Speaker,
+			Audio::LineLevel                 => DeviceType::Unknown,
+			Audio::Headphones                => DeviceType::Headphones,
+			Audio::Microphone                => DeviceType::Microphone,
+			Audio::Headset                   => DeviceType::Headset,
+			Audio::Handset                   => DeviceType::Handset,
+			Audio::UnknownDigitalPassthrough => DeviceType::Unknown,
+			Audio::SPDIF                     => DeviceType::Unknown,
+			Audio::DigitalAudioDisplayDevice => DeviceType::Unknown,
+			Audio::UnknownFormFactor         => DeviceType::Unknown,
+			_                                => DeviceType::Unknown
 		}
 		.pipe(Ok)
 	}
