@@ -6,7 +6,8 @@ use windows::Win32::Media::Audio::*;
 use windows_collections::IMapView;
 use windows_core::{Array, HSTRING, IInspectable, Interface, h};
 use crate::DeviceType;
-use super::utils::{WinResult, to_aqs};
+use super::native::to_aqs;
+use super::utils::WinResult;
 
 const PHYSICAL_DEVICE_LOCATION: &HSTRING = h!("System.Devices.PhysicalDeviceLocation");
 

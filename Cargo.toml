@@ -104,6 +104,7 @@ wasm-bindgen = [
 
 [dependencies]
 dasp_sample = "0.11"
+rand = "0.10.3"
 tap = "1.0.1"
 windows-collections = "0.3.2"
 
@@ -139,6 +140,7 @@ windows = { version = "0.62", features = [
 audio_thread_priority = { version = "0.36", optional = true, default-features = false }
 asio-sys = { version = "0.5.0", path = "asio-sys", optional = true }
 num-traits = { version = "0.2", optional = true }
+parking_lot = "0.12.5"
 jack = { version = "0.13.5", optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd"))'.dependencies]

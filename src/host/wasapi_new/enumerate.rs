@@ -8,6 +8,7 @@ use windows_collections::{IIterable, IIterator};
 use windows_core::HSTRING;
 
 use super::Device;
+use super::native::to_aqs;
 use super::utils::*;
 
 pub type Devices = Chain<PerDirectionIter, PerDirectionIter>;
@@ -20,15 +21,15 @@ pub fn devices() -> WinResult<Devices> {
 		to_aqs(&PKEY_AudioEndpoint_JackSubType),
 	].into();
 	
-	let infos_capture = get_dev_infos::<true >(extra_props.clone())?;
-	let infos_render  = get_dev_infos::<false>(extra_props)?;
+	let infos_capture = device_infos::<true >(&extra_props)?;
+	let infos_render  = device_infos::<false>(&extra_props)?;
 	
 	infos_capture
 		.chain(infos_render)
 		.pipe(Ok)
 }
 
-fn get_dev_infos<const INPUT: bool>(extra_props: IIterable<HSTRING>) -> WinResult<PerDirectionIter> {
+fn device_infos<const INPUT: bool>(extra_props: &IIterable<HSTRING>) -> WinResult<PerDirectionIter> {
 	let fn_get_selector = if INPUT {
 		MediaDevice::GetAudioCaptureSelector
 	} else {
@@ -37,7 +38,7 @@ fn get_dev_infos<const INPUT: bool>(extra_props: IIterable<HSTRING>) -> WinResul
 	
 	let map_fn: MapFn = |info| Device { info, input: INPUT }; // coerce unique function type to fn ptr to keep the iterator type nameable
 
-	DeviceInformation::FindAllAsyncAqsFilterAndAdditionalProperties(&fn_get_selector()?, &extra_props)?
+	DeviceInformation::FindAllAsyncAqsFilterAndAdditionalProperties(&fn_get_selector()?, extra_props)?
 		.join()?
 		.into_iter()
 		.map(map_fn)
@@ -45,13 +46,12 @@ fn get_dev_infos<const INPUT: bool>(extra_props: IIterable<HSTRING>) -> WinResul
 }
 
 pub fn get_default<const INPUT: bool>() -> WinResult<Device> {
-	let fn_get_id = if INPUT {
-		MediaDevice::GetDefaultAudioCaptureId
-	} else {
-		MediaDevice::GetDefaultAudioRenderId
-	};
-	
-	DeviceInformation::CreateFromIdAsync(&fn_get_id(AudioDeviceRole::Default)?)?
+	let id_getter =
+		if INPUT { MediaDevice::GetDefaultAudioCaptureId }
+		else     { MediaDevice::GetDefaultAudioRenderId };
+
+	id_getter(AudioDeviceRole::Default)?
+		.pipe_ref(DeviceInformation::CreateFromIdAsync)?
 		.join()
 		.map(|info| Device { info, input: INPUT })
 }
