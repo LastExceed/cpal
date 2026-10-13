@@ -69,7 +69,7 @@ pub fn create_waveformatextensible(sample_rate: u32, channel_mask: u32, cpal_for
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Client(IAudioClient3);
+pub struct Client(pub IAudioClient3);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capturer(IAudioCaptureClient);
 #[derive(Debug, Clone, PartialEq, Eq)]

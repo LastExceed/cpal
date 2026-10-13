@@ -1,4 +1,5 @@
 use std::iter::{Chain, Map};
+use std::sync::Arc;
 
 use tap::Pipe;
 use windows::Devices::Enumeration::DeviceInformation;
@@ -30,13 +31,11 @@ pub fn devices() -> WinResult<Devices> {
 }
 
 fn device_infos<const INPUT: bool>(extra_props: &IIterable<HSTRING>) -> WinResult<PerDirectionIter> {
-	let fn_get_selector = if INPUT {
-		MediaDevice::GetAudioCaptureSelector
-	} else {
-		MediaDevice::GetAudioRenderSelector
-	};
+	let fn_get_selector =
+		if INPUT { MediaDevice::GetAudioCaptureSelector }
+		else     { MediaDevice::GetAudioRenderSelector };
 	
-	let map_fn: MapFn = |info| Device { info, input: INPUT }; // coerce unique function type to fn ptr to keep the iterator type nameable
+	let map_fn: MapFn = |info| Device { info, input: INPUT, preliminary_client: Arc::default() }; // coerces unique function type to fn ptr to keep the iterator type nameable
 
 	DeviceInformation::FindAllAsyncAqsFilterAndAdditionalProperties(&fn_get_selector()?, extra_props)?
 		.join()?
@@ -46,12 +45,12 @@ fn device_infos<const INPUT: bool>(extra_props: &IIterable<HSTRING>) -> WinResul
 }
 
 pub fn get_default<const INPUT: bool>() -> WinResult<Device> {
-	let id_getter =
+	let fn_get_id =
 		if INPUT { MediaDevice::GetDefaultAudioCaptureId }
 		else     { MediaDevice::GetDefaultAudioRenderId };
 
-	id_getter(AudioDeviceRole::Default)?
+	fn_get_id(AudioDeviceRole::Default)?
 		.pipe_ref(DeviceInformation::CreateFromIdAsync)?
 		.join()
-		.map(|info| Device { info, input: INPUT })
+		.map(|info| Device { info, input: INPUT, preliminary_client: Arc::default() })
 }

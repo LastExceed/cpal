@@ -106,6 +106,7 @@ wasm-bindgen = [
 dasp_sample = "0.11"
 rand = "0.10.3"
 tap = "1.0.1"
+wasapi = "0.26.0"
 windows-collections = "0.3.2"
 
 [dev-dependencies]

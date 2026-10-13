@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tap::Pipe;
+use wasapi::Direction;
 use windows::Devices::Enumeration::DeviceInformation;
+use windows_core::Interface;
 
 use crate::ErrorKind::{BackendError, Other, ResourceExhausted};
 use crate::*;
@@ -112,6 +114,7 @@ impl Device {
 	
 	fn configs(&self) -> Result<(), Error> {
 		let temp_client = self.activate_client()?;
+		let x = wasapi::AudioClient::from_iaudioclient(temp_client.0.cast().cast().unwrap(), if self.input { Direction::Capture } else { Direction::Render });
 
 		let mut all = HashSet::new();
 		
