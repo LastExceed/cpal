@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fmt::{self, Display};
+use std::fmt::{self, Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::{thread, vec};
@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tap::Pipe;
-use wasapi::Direction;
+use wasapi::{AudioClient, Direction, SampleType, ShareMode, WaveFormat};
 use windows::Devices::Enumeration::DeviceInformation;
 use windows_core::Interface;
 
@@ -23,6 +23,7 @@ mod processing;
 mod properties;
 mod native;
 mod utils;
+mod device_instance;
 
 pub struct Host;
 
@@ -33,7 +34,7 @@ impl Host {
 }
 
 impl HostTrait for Host {
-	type Devices = enumerate::Devices;
+	type Devices = vec::IntoIter<Device>;
 
 	type Device = Device;
 
@@ -42,8 +43,21 @@ impl HostTrait for Host {
 	}
 
 	fn devices(&self) -> Result<Self::Devices, Error> {
-		enumerate::devices()
-			.map_err(|win_err| Error::with_message(BackendError, format!("{win_err:?}")))
+		let enumerator = wasapi::DeviceEnumerator::new().unwrap();
+		
+		let capture_collection = enumerator.get_device_collection(&Direction::Capture).unwrap();
+		let  render_collection = enumerator.get_device_collection(&Direction::Render ).unwrap();
+		
+		let capture_iter = capture_collection.into_iter();
+		let  render_iter =  render_collection.into_iter();
+
+		capture_iter
+			.chain(render_iter)
+			.filter_map(Result::ok)
+			.map(|native_device| Device { native_device, provisional_client: Mutex::default() })
+			.collect::<Vec<_>>()
+			.into_iter()
+			.pipe(Ok)
 	}
 
 	fn default_input_device(&self) -> Option<Self::Device> {
@@ -55,18 +69,14 @@ impl HostTrait for Host {
 	}
 }
 
-#[derive(Debug, Clone)]
 pub struct Device {
-	info: DeviceInformation,
-	input: bool,
-	preliminary_client: Arc<Mutex<Option<Client>>>
+	native_device: wasapi::Device,
+	provisional_client: Mutex<Option<AudioClient>>
 }
 
 impl PartialEq for Device {
 	fn eq(&self, other: &Self) -> bool {
-		self.info == other.info
-		&& self.input == other.input
-		&& Arc::ptr_eq(&self.preliminary_client, &other.preliminary_client)
+		todo!()
 	}
 }
 
@@ -85,50 +95,84 @@ impl Display for Device {
 }
 
 impl Device {
-	pub fn description_inner(&self) -> WinResult<DeviceDescription> {
-		let props       = self.info.Properties()?.pipe(properties::Facade);
-		let name        = self.info.Name()?.to_string_lossy();
-		let direction   = if self.input { DeviceDirection::Input } else { DeviceDirection::Output };
-		// let device_type = props.device_type()?;
-		
-		let mut builder = DeviceDescriptionBuilder
-			::new(name)
-			.direction(direction);
-			// .device_type(device_type);
-		
-		if let Some(addr) = props.physical_location()? {
-			builder = builder.address(addr);
+	fn ensure_client(&self) {
+		let mut guard = self.provisional_client.lock();
+		if guard.is_some() {
+			return;
 		}
+		*guard = self.native_device.get_iaudioclient().unwrap().pipe(Some);
+	}
+	
+	pub fn description_inner(&self) -> WinResult<DeviceDescription> {
+		DeviceDescriptionBuilder
+			::new(self.native_device.get_description().unwrap())
+    		.driver(self.native_device.get_interface_friendlyname().unwrap())
 		
-		// .interface_type(crate::InterfaceType::Hdmi)
-		// .manufacturer("")
-		// .driver("")
+		
+		
+		// driver
+		// device_type
+		// interface_type
+		// direction
+		
+		// manufacturer
+		// address
+		// extended
+    .;
 			
 		Ok(builder.build())
 	}
 	
-	fn activate_client(&self) -> Result<Client, Error> {
-		let path = self.info.Id().context("path")?;
-		Client::activate(&path).context("ac3 activate")
-	}
-	
 	fn configs(&self) -> Result<(), Error> {
-		let temp_client = self.activate_client()?;
-		let x = wasapi::AudioClient::from_iaudioclient(temp_client.0.cast().cast().unwrap(), if self.input { Direction::Capture } else { Direction::Render });
-
-		let mut all = HashSet::new();
+		self.ensure_client();
+		let guard = self.provisional_client.lock();
+		let client = guard.as_ref().unwrap();
 		
-		use SampleFormat::*;
-		for &sample_rate in COMMON_SAMPLE_RATES {
-			for cpal_format in [I16, I24, I32, F32] {
-				for channel_mask in [0b1, 0b11, 0b111, 0b1111, 0b11111] {
-					let wave_format = create_waveformatextensible(sample_rate, channel_mask, cpal_format);
-					if let Some(x) = temp_client.is_format_supported(&raw const wave_format.Format)? {
-						all.insert(x);
-					}
-				}
-			}
-		}
+		let waveformats = self
+			.native_device
+			.get_data_ranges()
+			.unwrap()
+			.into_iter()
+			.flat_map(move |range| {
+				COMMON_SAMPLE_RATES
+					.into_iter()
+					.copied()
+					.skip_while(move |rate| *rate < range.min_samplerate)
+					.take_while(move |rate| *rate <= range.max_samplerate)
+    				.flat_map(move |sample_rate|
+						(1..=range.max_channels)
+        					.flat_map(move |channel_count| {
+								use SampleFormat::*;
+								[I8, I16, I24, I32, F32]
+									.into_iter()
+        							.filter(move |format|
+										range
+											.sample_type()
+											.is_none_or(|ty|
+												(ty == SampleType::Int)
+													== format.is_int()
+											)
+									)
+									.map(move |format| (format, format.sample_size() * 8))
+									.skip_while(move |(_format, store_bits)| range.min_bits_per_sample >  *store_bits as u32)
+									.take_while(move |(_format, store_bits)| range.max_bits_per_sample >= *store_bits as u32)
+        							.map(move |(format, store_bits)| WaveFormat::new(
+										store_bits,
+										format.bits_per_sample() as _,
+										&SampleType::Int,
+										sample_rate as _,
+										channel_count as _,
+										None
+									))
+							})
+					)
+			})
+			.filter_map(|waveformat|
+				client
+					.is_supported(&waveformat, &ShareMode::Shared)
+					.map(|ret| ret.unwrap_or(waveformat))
+    				.ok()
+			);
 		
 		Ok(())
 	}
