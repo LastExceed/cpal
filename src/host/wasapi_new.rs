@@ -7,35 +7,31 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tap::Pipe;
-use wasapi::{AudioClient, Direction, SampleType, ShareMode, WaveFormat};
-use windows::Devices::Enumeration::DeviceInformation;
-use windows_core::Interface;
+use wasapi::{AudioClient, DeviceEnumerator, Direction, SampleType, ShareMode, StreamMode, WaveFormat};
 
 use crate::ErrorKind::{BackendError, Other, ResourceExhausted};
 use crate::*;
 use crate::traits::*;
 
-use self::native::*;
 use self::utils::*;
 
-mod enumerate;
 mod processing;
-mod properties;
-mod native;
+mod winrt;
 mod utils;
-mod device_instance;
+
+type Devices = vec::IntoIter<Device>;
+type SupportedConfigs = vec::IntoIter<SupportedStreamConfigRange>;
 
 pub struct Host;
 
 impl Host {
-	pub const fn new() -> Result<Self, crate::Error> {
+	pub const fn new() -> Result<Self, Error> {
 		Ok(Self)
 	}
 }
 
 impl HostTrait for Host {
-	type Devices = vec::IntoIter<Device>;
-
+	type Devices = Devices;
 	type Device = Device;
 
 	fn is_available() -> bool {
@@ -43,7 +39,7 @@ impl HostTrait for Host {
 	}
 
 	fn devices(&self) -> Result<Self::Devices, Error> {
-		let enumerator = wasapi::DeviceEnumerator::new().unwrap();
+		let enumerator = DeviceEnumerator::new().unwrap();
 		
 		let capture_collection = enumerator.get_device_collection(&Direction::Capture).unwrap();
 		let  render_collection = enumerator.get_device_collection(&Direction::Render ).unwrap();
@@ -61,21 +57,27 @@ impl HostTrait for Host {
 	}
 
 	fn default_input_device(&self) -> Option<Self::Device> {
-		enumerate::get_default::<true>().ok()
+		Device::system_default(Direction::Capture)
 	}
 	
 	fn default_output_device(&self) -> Option<Self::Device> {
-		enumerate::get_default::<false>().ok()
+		Device::system_default(Direction::Render)
 	}
 }
 
 pub struct Device {
 	native_device: wasapi::Device,
-	provisional_client: Mutex<Option<AudioClient>>
+	provisional_client: Mutex<Option<SendSync<AudioClient>>>
+}
+
+impl Debug for Device {
+	fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		todo!()
+	}
 }
 
 impl PartialEq for Device {
-	fn eq(&self, other: &Self) -> bool {
+	fn eq(&self, _other: &Self) -> bool {
 		todo!()
 	}
 }
@@ -83,53 +85,77 @@ impl PartialEq for Device {
 impl Eq for Device {}
 
 impl Hash for Device {
-	fn hash<H: Hasher>(&self, state: &mut H) {
+	fn hash<H: Hasher>(&self, _state: &mut H) {
 		todo!()
 	}
 }
 
 impl Display for Device {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+	fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		todo!()
 	}
 }
 
+impl From<wasapi::Device> for Device {
+	fn from(value: wasapi::Device) -> Self {
+		Self {
+			native_device: value,
+			provisional_client: Mutex::default()
+		}
+	}
+}
+
+// SAFETY:
+// WASAPI's COM interfaces implement IMarshal,
+unsafe impl Send for Device {}
+unsafe impl Sync for Device {}
+
 impl Device {
+	fn system_default(direction: Direction) -> Option<Self> {
+		DeviceEnumerator
+			::new()
+			.unwrap()
+			.get_default_device(&direction)
+			.ok()
+			.map(Self::from)
+	}
+	
 	fn ensure_client(&self) {
 		let mut guard = self.provisional_client.lock();
 		if guard.is_some() {
 			return;
 		}
-		*guard = self.native_device.get_iaudioclient().unwrap().pipe(Some);
+		*guard = self
+			.native_device
+			.get_iaudioclient()
+			.unwrap()
+			.pipe(SendSync)
+			.pipe(Some);
 	}
 	
 	pub fn description_inner(&self) -> WinResult<DeviceDescription> {
 		DeviceDescriptionBuilder
 			::new(self.native_device.get_description().unwrap())
     		.driver(self.native_device.get_interface_friendlyname().unwrap())
-		
-		
-		
-		// driver
-		// device_type
-		// interface_type
-		// direction
-		
-		// manufacturer
-		// address
-		// extended
-    .;
-			
-		Ok(builder.build())
+    		.direction(self.native_device.get_direction().into())
+    		// .device_type(todo!())
+    		// .interface_type(todo!())
+			.build()
+			.pipe(Ok)
 	}
 	
-	fn configs(&self) -> Result<(), Error> {
+	fn configs(&self, direction: Direction) -> Result<SupportedConfigs, Error> {
+		use SampleFormat::*;
+		
+		if self.native_device.get_direction() != direction {
+			return Err(todo!());
+		}
+		
 		self.ensure_client();
 		let guard = self.provisional_client.lock();
 		let client = guard.as_ref().unwrap();
-		
-		let waveformats = self
-			.native_device
+
+		self.native_device
 			.get_data_ranges()
 			.unwrap()
 			.into_iter()
@@ -141,8 +167,7 @@ impl Device {
 					.take_while(move |rate| *rate <= range.max_samplerate)
     				.flat_map(move |sample_rate|
 						(1..=range.max_channels)
-        					.flat_map(move |channel_count| {
-								use SampleFormat::*;
+        					.flat_map(move |channel_count|
 								[I8, I16, I24, I32, F32]
 									.into_iter()
         							.filter(move |format|
@@ -164,44 +189,70 @@ impl Device {
 										channel_count as _,
 										None
 									))
-							})
+							)
 					)
 			})
+			.collect::<HashSet<_>>() // dedup to avoid redundant requests to the audio client
+			.into_iter()
 			.filter_map(|waveformat|
 				client
 					.is_supported(&waveformat, &ShareMode::Shared)
 					.map(|ret| ret.unwrap_or(waveformat))
     				.ok()
-			);
-		
-		Ok(())
+			)
+			.collect::<HashSet<_>>() // dedup again, since `.is_supported()` might have reported the same "closest match" multiple times
+			.into_iter()
+			.map(SupportedStreamConfigRange::from)
+			.collect::<Vec<_>>() 
+			.into_iter()
+			.pipe(Ok)
 	}
 
-	fn build_stream_inner<FnProcess, FnCreateFnProcess>(&self, fn_create_fn_process: FnCreateFnProcess) -> Result<Stream, Error>
+	fn build_stream_inner<FnProcess, FnCreateFnProcess>(
+		&self,
+		config: StreamConfig,
+		sample_format: SampleFormat,
+		direction: Direction,
+		fn_create_fn_process: FnCreateFnProcess
+	) -> Result<Stream, Error>
 	where 
-		FnProcess        : FnMut (&Client) + Send + 'static,
+		FnProcess        : FnMut (&AudioClient) + Send + 'static,
 		FnCreateFnProcess: FnOnce(&Stream) -> FnProcess
 	{
-		let client = self.activate_client()?;
+		self.ensure_client();
+		let mut client = self.provisional_client.lock().take().unwrap();
 
-		let (format, period_frames) = client.get_current_shared_mode_engine_period().context("periods")?;
+		let waveformat = get_waveformat();
+		let period_frames = match config.buffer_size {
+			BufferSize::Fixed(n) => n,
+			BufferSize::Default => client.get_shared_mode_engine_period(&waveformat).unwrap().default
+		};
+		client
+			.initialize_client(
+				&waveformat,
+				&direction,
+				&StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: 0 }
+			)
+			.unwrap();
 		
-		client.initialize_shared_audio_stream(period_frames, format.cast_const()).context("init")?;
-		
-		let buffer_event = client.set_event_handle().context("set event")?;
-		let total_frames = client.get_buffer_size().context("buf size")?;
-		let stream_state = WaitableStreamState::new().context("signal")?.pipe(Arc::new);
-		
+		let buffer_event = client.set_get_eventhandle().unwrap().pipe(SendSync);
+		let total_frames = client.get_buffer_size().unwrap();
+		let stream_state = WaitableStreamState::new().unwrap().pipe(Arc::new);
+
 		let stream = Stream {
 			total_frames,
 			period_frames,
-			client: client.clone(), // COM pointers are essentially arcs
+			client,
 			state: Arc::clone(&stream_state)
 		};
 		
+		let scratch_len = stream.total_frames as usize * config.channels as usize * sample_format.sample_size();
+		let mut scratch = vec![0_u8; scratch_len].into_boxed_slice();
+
 		let fn_process = fn_create_fn_process(&stream);
 
 		thread::spawn(move || {
+			let buffer_event = buffer_event;
 			processing::run_loop(
 				&buffer_event,
 				&client,
@@ -215,8 +266,8 @@ impl Device {
 }
 
 impl DeviceTrait for Device {
-	type SupportedInputConfigs = vec::IntoIter<SupportedStreamConfigRange>;
-	type SupportedOutputConfigs = vec::IntoIter<SupportedStreamConfigRange>;
+	type SupportedInputConfigs = SupportedConfigs;
+	type SupportedOutputConfigs = SupportedConfigs;
 	type Stream = Stream;
 
 	fn description(&self) -> Result<DeviceDescription, Error> {		
@@ -229,11 +280,11 @@ impl DeviceTrait for Device {
 	}
 
 	fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
-		
+		self.configs(Direction::Capture)
 	}
 
 	fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
-		todo!()
+		self.configs(Direction::Render)
 	}
 
 	fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
@@ -256,14 +307,22 @@ impl DeviceTrait for Device {
 		D: FnMut(&Data, &CallbackInfo) + Send + 'static,
 		E: FnMut(Error) + Send + 'static
 	{
-		self.build_stream_inner(|stream: &Stream| {
-			let capturer = stream.client.get_capturer().unwrap();
+		self.build_stream_inner(
+			config,
+			sample_format,
+			Direction::Capture,
+			|stream: &Stream| {
+				let capturer = stream
+					.client
+					.get_audiocaptureclient()
+					.unwrap()
+					.pipe(SendSync);
 
-			let scratch_len = stream.total_frames as usize * config.channels as usize * sample_format.sample_size();
-			let mut scratch = vec![0_u8; scratch_len].into_boxed_slice();
-			
-			move |_client| processing::capture(&capturer, &mut data_callback, sample_format, &mut scratch)
-		})
+				let scratch_len = stream.total_frames as usize * config.channels as usize * sample_format.sample_size();
+				let mut scratch = vec![0_u8; scratch_len].into_boxed_slice();
+				
+				move |_client| processing::capture(&capturer, &mut data_callback, sample_format, &mut scratch)
+			})
 	}
 
 	fn build_output_stream_raw<D, E>(
@@ -278,21 +337,31 @@ impl DeviceTrait for Device {
 		D: FnMut(&mut Data, &CallbackInfo) + Send + 'static,
 		E: FnMut(Error) + Send + 'static
 	{
-		self.build_stream_inner(|stream: &Stream| {
-			let renderer     = stream.client.get_renderer().unwrap();
-			let total_frames = stream.total_frames;
+		self.build_stream_inner(config, Direction::Render, |stream: &Stream| {
+			let renderer     = stream.client.get_audiorenderclient().unwrap().pipe(SendSync);
 			
-			move |client| processing::render(&renderer, &mut data_callback, sample_format, client, total_frames)
+			let scratch_len = stream.total_frames as usize * config.channels as usize * sample_format.sample_size();
+			let mut scratch = vec![0_u8; scratch_len].into_boxed_slice();
+			
+			move |client| processing::render(&renderer, &mut data_callback, sample_format, client, &mut scratch)
 		})
 	}
 }
 
-#[derive(Debug)]
 pub struct Stream {
 	total_frames : u32,
 	period_frames: u32,
-	client       : Client,
+	client       : SendSync<AudioClient>,
 	state        : Arc<WaitableStreamState>
+}
+
+unsafe impl Send for Stream {}
+unsafe impl Sync for Stream {}
+
+impl Debug for Stream {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		todo!()
+	}
 }
 
 impl StreamTrait for Stream {
@@ -333,8 +402,8 @@ impl StreamTrait for Stream {
 	fn buffer_size(&self) -> Result<FrameCount, Error> {
 		self.client
 			.get_current_padding()
-			.context("pad")
 			.map(|padding| self.total_frames - padding + self.period_frames)
+			.map_err(|_| todo!())
 	}
 
 	fn now(&self) -> StreamInstant {
