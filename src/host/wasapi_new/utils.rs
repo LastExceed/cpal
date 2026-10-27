@@ -1,31 +1,128 @@
+use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::fmt::Debug;
 use std::mem::transmute;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc;
 use std::slice;
+use std::time::Duration;
 use tap::Pipe;
-use wasapi::{Direction, WaveFormat};
-use windows::Win32::Foundation::{E_POINTER, PROPERTYKEY};
-use windows::Win32::Media::Audio::*;
-use windows_core::{HRESULT, HSTRING, IUnknown, implement};
+use wasapi::{Direction, WasapiError, WaveFormat};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject};
 
-use crate::{DeviceDirection, SupportedStreamConfigRange};
+use crate::{DeviceDirection, SampleFormat, SupportedStreamConfigRange};
 
 pub type WinResult<T> = windows_core::Result<T>;
 
-#[expect(clippy::cast_ptr_alignment, reason = "guaranteed by WASAPI")]
-pub fn shift_up(ptr: *mut u8, sample_count: usize) {
-	let slice = unsafe { slice::from_raw_parts_mut(ptr.cast::<i32>(), sample_count) };
-	for sample in slice {
-		*sample <<= 8;
+pub struct ScratchBuffer {
+	pub ptr: *mut u8,
+	pub layout: Layout
+}
+
+unsafe impl Send for ScratchBuffer {}
+unsafe impl Sync for ScratchBuffer {}
+
+impl ScratchBuffer {
+	pub fn new(sample_count: usize, format: SampleFormat) -> Self {
+		let size   = sample_count * format.sample_size();
+		let align  = format.sample_size();
+		let layout = Layout::from_size_align(size, align).unwrap();
+		let ptr    = unsafe { alloc_zeroed(layout) };
+		
+		Self { ptr, layout }
+	}
+	
+	pub fn slice(&mut self) -> &mut [u8] {
+		unsafe {
+			slice::from_raw_parts_mut(
+				self.ptr,
+				self.layout.size()
+			)
+		}
+	}
+	
+	fn slice_i32(&mut self) -> &mut [i32] {
+		unsafe {
+			slice::from_raw_parts_mut(
+				self.ptr.cast(),
+				self.layout.size() / size_of::<i32>()
+			)
+		}
+	}
+	
+	#[expect(clippy::cast_ptr_alignment, reason = "guaranteed by WASAPI")]
+	pub fn shift_up(&mut self, sample_count: usize) {
+		for sample in &mut self.slice_i32()[..sample_count] {
+			*sample <<= 8;
+		}
+	}
+
+	#[expect(clippy::cast_ptr_alignment, reason = "guaranteed by WASAPI")]
+	pub fn shift_down(&mut self, sample_count: usize) {
+		for sample in &mut self.slice_i32()[..sample_count] {
+			*sample >>= 8;
+		}
 	}
 }
 
-#[expect(clippy::cast_ptr_alignment, reason = "guaranteed by WASAPI")]
-pub fn shift_down(ptr: *mut u8, sample_count: usize) {
-	let slice = unsafe { slice::from_raw_parts_mut(ptr.cast::<i32>(), sample_count) };
-	for sample in slice {
-		*sample >>= 8;
+impl Drop for ScratchBuffer {
+	fn drop(&mut self) {
+		unsafe { dealloc(self.ptr, self.layout) };
+	}
+}
+
+pub struct Event(HANDLE);
+
+unsafe impl Send for Event {}
+unsafe impl Sync for Event {}
+
+impl Debug for Event {
+	fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		todo!()
+	}
+}
+
+impl Event {
+	pub fn new() -> WinResult<Self> {
+		unsafe { CreateEventW(None, false, true, None) }
+			.map(Self)
+	}
+	
+	pub const fn as_raw(&self) -> &HANDLE {
+		&self.0
+	}
+	
+	pub fn set_signaled(&self) -> WinResult<()> {
+		unsafe { SetEvent(self.0) }
+	}
+	
+	pub fn wait_single(&self, timeout: Option<Duration>) -> WinResult<bool> {
+		let millis = timeout.map_or(INFINITE, |duration| duration.as_millis() as _);
+
+		match unsafe { WaitForSingleObject(self.0, millis) } {
+			WAIT_OBJECT_0 => Ok(true),
+			WAIT_TIMEOUT => Ok(false),
+			WAIT_FAILED => Err(windows_core::Error::from_thread()),
+			_          => unreachable!()
+		}
+	}
+	
+	pub fn wait_multiple(events: &[HANDLE], timeout: Option<Duration>) -> WinResult<Option<usize>> {
+		let dwmilliseconds = timeout.map_or(INFINITE, |duration| duration.as_millis() as _);
+		let wait_event = unsafe { WaitForMultipleObjects(events, false, dwmilliseconds) };
+		
+		#[deny(nonstandard_style, reason = "prevent accidental wildcards")]
+		match wait_event {
+			WAIT_FAILED => Err(windows_core::Error::from_thread()),
+			WAIT_TIMEOUT => Ok(None),
+			WAIT_EVENT(i) => Ok(Some(i as _))
+		}
+	}
+}
+
+impl Drop for Event {
+	fn drop(&mut self) {
+		_ = unsafe { CloseHandle(self.0) };
 	}
 }
 
@@ -56,14 +153,23 @@ impl WaitableStreamState {
 		unsafe { transmute(self.atomic.load(Ordering::Relaxed)) }
 	}
 	
-	pub fn set(&self, value: StreamState) -> WinResult<()> {
+	pub fn set(&self, value: StreamState, signal: bool) -> WinResult<()> {
 		self.atomic.store(value as _, Ordering::Relaxed);
-		self.event.set()
+		if signal {
+			self.event.set_signaled()?;
+		}
+		Ok(())
 	}
 	
 	#[must_use]
 	pub const fn event(&self) -> &Event {
 		&self.event
+	}
+}
+
+impl From<WasapiError> for crate::Error {
+	fn from(value: WasapiError) -> Self {
+		todo!()
 	}
 }
 
@@ -77,7 +183,7 @@ impl From<Direction> for DeviceDirection {
 }
 
 impl From<WaveFormat> for SupportedStreamConfigRange {
-	fn from(value: WaveFormat) -> Self {
+	fn from(_value: WaveFormat) -> Self {
 		todo!()
 	}
 }
@@ -99,50 +205,8 @@ impl<T> Deref for SendSync<T> {
 	}
 }
 
-#[implement(IActivateAudioInterfaceCompletionHandler)]
-struct ActivateAudioInterfaceCompletionHandler(mpsc::Sender<WinResult<IUnknown>>);
-
-impl IActivateAudioInterfaceCompletionHandler_Impl for ActivateAudioInterfaceCompletionHandler_Impl {
-    fn ActivateCompleted(&self, activate_operation: windows_core::Ref<'_, IActivateAudioInterfaceAsyncOperation>) -> windows_core::Result<()> {
-        let e_pointer1 = windows_core::Error::from(E_POINTER);
-		let e_pointer2 = e_pointer1.clone();
-		let e_pointer3 = e_pointer1.clone();
-		
-		let op = activate_operation
-			.as_ref()
-			.ok_or(e_pointer1)?;
-		
-		let mut hresult = HRESULT::default();
-        let mut out = None;
-		
-		unsafe { op.GetActivateResult(&raw mut hresult, &raw mut out) }?;
-    
-		let result = hresult.ok().and(out.ok_or(e_pointer2));
-
-		self.0
-			.send(result)
-			.map_err(|_| e_pointer3)?;
-
-        Ok(())
-    }
-}
-
-pub trait BufferFlagsExt {
-	fn data_discontinuity(&self) -> bool;
-	fn silent(&self) -> bool;
-	fn timestamp_error(&self) -> bool;
-}
-
-impl BufferFlagsExt for _AUDCLNT_BUFFERFLAGS {
-	fn data_discontinuity(&self) -> bool {
-		self.0 & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 != 0
-	}
-	
-	fn silent(&self) -> bool {
-		self.0 & AUDCLNT_BUFFERFLAGS_SILENT.0 != 0
-	}
-	
-	fn timestamp_error(&self) -> bool {
-		self.0 & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 != 0
+impl<T> DerefMut for SendSync<T> {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		&mut self.0
 	}
 }

@@ -1,6 +1,6 @@
 use crate::DeviceType;
 use std::iter::{Chain, Map};
-use super::Device;
+use super::DeviceHandle;
 use super::utils::WinResult;
 use tap::Pipe;
 use windows_collections::{IIterable, IIterator};
@@ -15,7 +15,7 @@ use windows::Win32::Media::Audio::*;
 
 pub type Devices = Chain<PerDirectionIter, PerDirectionIter>;
 type PerDirectionIter = Map<IIterator<DeviceInformation>, MapFn>;
-type MapFn = fn(DeviceInformation) -> Device;
+type MapFn = fn(DeviceInformation) -> DeviceHandle;
 
 pub fn to_aqs(PROPERTYKEY { fmtid, pid }: &PROPERTYKEY) -> HSTRING {
 	format!("{{{fmtid:?}}} {pid}").into()
@@ -40,16 +40,17 @@ fn device_infos<const INPUT: bool>(extra_props: &IIterable<HSTRING>) -> WinResul
 		if INPUT { MediaDevice::GetAudioCaptureSelector }
 		else     { MediaDevice::GetAudioRenderSelector };
 	
-	let map_fn: MapFn = |info| todo!(); // coerces unique function type to fn ptr to keep the iterator type nameable
+	let map_fn: MapFn = |_info| todo!(); // coerces unique function type to fn ptr to keep the iterator type nameable
 
-	DeviceInformation::FindAllAsyncAqsFilterAndAdditionalProperties(&fn_get_selector()?, extra_props)?
+	DeviceInformation
+		::FindAllAsyncAqsFilterAndAdditionalProperties(&fn_get_selector()?, extra_props)?
 		.join()?
 		.into_iter()
 		.map(map_fn)
 		.pipe(Ok)
 }
 
-pub fn get_default<const INPUT: bool>() -> WinResult<Device> {
+pub fn get_default<const INPUT: bool>() -> WinResult<DeviceHandle> {
 	let fn_get_id =
 		if INPUT { MediaDevice::GetDefaultAudioCaptureId }
 		else     { MediaDevice::GetDefaultAudioRenderId };
@@ -57,7 +58,7 @@ pub fn get_default<const INPUT: bool>() -> WinResult<Device> {
 	fn_get_id(AudioDeviceRole::Default)?
 		.pipe_ref(DeviceInformation::CreateFromIdAsync)?
 		.join()
-		.map(|info| todo!())
+		.map(|_info| todo!())
 }
 
 const PHYSICAL_DEVICE_LOCATION: &HSTRING = h!("System.Devices.PhysicalDeviceLocation");
@@ -66,7 +67,7 @@ pub struct Facade(pub IMapView<HSTRING, IInspectable>);
 
 impl Facade {
 	pub fn device_type(&self) -> WinResult<DeviceType> {
-		let eff = self.0
+		let aeff = self.0
 			.Lookup(&to_aqs(&PKEY_AudioEndpoint_FormFactor))?
 			.cast::<IPropertyValue>()?
 			.GetInt32()?
@@ -75,7 +76,7 @@ impl Facade {
 		#[deny(nonstandard_style, reason = "typos would silently turn these into wildcard patterns")]
 		#[expect(unused_qualifications, reason = "rustc bug?")]
 		#[expect(clippy::match_same_arms, reason = "happenstance")]
-		match eff {
+		match aeff {
 			Audio::RemoteNetworkDevice       => DeviceType::Unknown,
 			Audio::Speakers                  => DeviceType::Speaker,
 			Audio::LineLevel                 => DeviceType::Unknown,

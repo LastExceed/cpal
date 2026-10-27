@@ -106,7 +106,6 @@ wasm-bindgen = [
 dasp_sample = "0.11"
 rand = "0.10.3"
 tap = "1.0.1"
-wasapi = { git = "https://github.com/LastExceed/wasapi-rs", branch = "waveformat-cmp" }
 windows-collections = "0.3.2"
 
 [dev-dependencies]
@@ -117,6 +116,7 @@ clap = { version = "4.6", features = ["derive"] }
 
 # `windows` and `windows-core` must be the same minor version.
 [target.'cfg(target_os = "windows")'.dependencies]
+wasapi = { git = "https://github.com/HEnquist/wasapi-rs", rev = "99ec38132c23c99c8983e5142083bed532e5c3aa" }
 windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Media",
