@@ -15,19 +15,18 @@ pub fn run_loop<Processor, DataCallback>(
 	audio_client : &AudioClient,
 	processor    : &SendSync<Processor>,
 	stream_state : &WaitableStreamState,
+	scratch_buf  : &mut ScratchBuffer,
 	data_callback: &mut DataCallback,
 	fn_process   : FnProcess<Processor, DataCallback>,
 	sample_format: SampleFormat,
-	scratch_buf  : &mut ScratchBuffer,
+	channel_count: usize
 ) -> Result<(), Error> {
-	let channel_count = 2; // todo
-	
 	loop {
 		wait_event(stream_state, buffer_event, None).context("wait event")?;
 
 		#[deny(non_snake_case, reason = "prevent accidental wildcard patterns from typos")]
 		match stream_state.get() {
-			Running  => fn_process(audio_client, processor, data_callback, sample_format, channel_count, scratch_buf).context("process")?,
+			Running  => fn_process(audio_client, processor, data_callback, scratch_buf, sample_format, channel_count).context("process")?,
 			
 			Draining if audio_client.get_current_padding().context("get padding")? > 0
 				     => continue,
@@ -65,22 +64,19 @@ pub type FnProcess<Processor, DataCallback> = fn(
 	audio_client : &AudioClient,
 	processor    : &Processor,
 	data_callback: &mut DataCallback,
+	scratch_buf  : &mut ScratchBuffer,
 	sample_format: SampleFormat,
-	channel_count: usize,
-	scratch_buf  : &mut ScratchBuffer
+	channel_count: usize
 ) -> Result<(), WasapiError>;
 
-pub fn capture<DataCallback>(
+pub fn capture(
 	_audio_client : &AudioClient, // only here to match the function signature of [`render`]
 	capture_client: &AudioCaptureClient,
-	data_callback : &mut DataCallback,
+	data_callback : &mut (impl FnMut(&Data, &CallbackInfo) + Send + 'static),
+	scratch_buf   : &mut ScratchBuffer,
 	sample_format : SampleFormat,
-	channel_count : usize,
-	scratch_buf   : &mut ScratchBuffer
-) -> Result<(), WasapiError>
-where 
-	DataCallback: FnMut(&Data, &CallbackInfo) + Send + 'static
-{
+	channel_count : usize
+) -> Result<(), WasapiError> {
 	let (frame_count, buffer_info) = capture_client.read_from_device(scratch_buf.slice())?;
 	let sample_count = frame_count as usize * channel_count;
 
@@ -103,9 +99,9 @@ pub fn render(
 	audio_client : &AudioClient,
 	render_client: &AudioRenderClient,
 	data_callback: &mut (impl FnMut(&mut Data, &CallbackInfo) + Send + 'static),
+	scratch_buf  : &mut ScratchBuffer,
 	sample_format: SampleFormat,
-	channel_count: usize,
-	scratch_buf  : &mut ScratchBuffer
+	channel_count: usize
 ) -> Result<(), WasapiError> {
 	let frame_count  = audio_client.get_available_space_in_frames().unwrap();
 	let sample_count = frame_count as usize * channel_count;

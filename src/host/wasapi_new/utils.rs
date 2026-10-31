@@ -1,4 +1,5 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::error::Error;
 use std::fmt::Debug;
 use std::mem::transmute;
 use std::ops::{Deref, DerefMut};
@@ -10,9 +11,14 @@ use wasapi::{Direction, WasapiError, WaveFormat};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject};
 
+use crate::ErrorKind::BackendError;
 use crate::{DeviceDirection, SampleFormat, SupportedStreamConfigRange};
 
 pub type WinResult<T> = windows_core::Result<T>;
+
+pub fn convert_error(error: impl Error) -> crate::Error {
+	crate::Error::with_message(BackendError, format!("{error:?}"))
+}
 
 pub struct ScratchBuffer {
 	pub ptr: *mut u8,
@@ -192,6 +198,7 @@ pub fn get_waveformat() -> WaveFormat {
 	todo!()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SendSync<T>(pub T);
 
 unsafe impl<T> Send for SendSync<T> {}

@@ -1,6 +1,6 @@
-use crate::DeviceType;
+use crate::{DeviceType, InterfaceType};
 use std::iter::{Chain, Map};
-use super::DeviceHandle;
+use super::Device;
 use super::utils::WinResult;
 use tap::Pipe;
 use windows_collections::{IIterable, IIterator};
@@ -15,13 +15,13 @@ use windows::Win32::Media::Audio::*;
 
 pub type Devices = Chain<PerDirectionIter, PerDirectionIter>;
 type PerDirectionIter = Map<IIterator<DeviceInformation>, MapFn>;
-type MapFn = fn(DeviceInformation) -> DeviceHandle;
+type MapFn = fn(DeviceInformation) -> Device;
 
 pub fn to_aqs(PROPERTYKEY { fmtid, pid }: &PROPERTYKEY) -> HSTRING {
 	format!("{{{fmtid:?}}} {pid}").into()
 }
 
-pub fn devices() -> WinResult<Devices> {
+pub fn all() -> WinResult<Devices> {
 	let extra_props: IIterable<HSTRING> = vec![
 		to_aqs(&PKEY_AudioEndpoint_FormFactor),
 		to_aqs(&PKEY_AudioEndpoint_JackSubType),
@@ -50,7 +50,7 @@ fn device_infos<const INPUT: bool>(extra_props: &IIterable<HSTRING>) -> WinResul
 		.pipe(Ok)
 }
 
-pub fn get_default<const INPUT: bool>() -> WinResult<DeviceHandle> {
+pub fn default<const INPUT: bool>() -> WinResult<DeviceInformation> {
 	let fn_get_id =
 		if INPUT { MediaDevice::GetDefaultAudioCaptureId }
 		else     { MediaDevice::GetDefaultAudioRenderId };
@@ -58,7 +58,6 @@ pub fn get_default<const INPUT: bool>() -> WinResult<DeviceHandle> {
 	fn_get_id(AudioDeviceRole::Default)?
 		.pipe_ref(DeviceInformation::CreateFromIdAsync)?
 		.join()
-		.map(|_info| todo!())
 }
 
 const PHYSICAL_DEVICE_LOCATION: &HSTRING = h!("System.Devices.PhysicalDeviceLocation");
@@ -66,29 +65,44 @@ const PHYSICAL_DEVICE_LOCATION: &HSTRING = h!("System.Devices.PhysicalDeviceLoca
 pub struct Facade(pub IMapView<HSTRING, IInspectable>);
 
 impl Facade {
-	pub fn device_type(&self) -> WinResult<DeviceType> {
+	pub fn kind(&self) -> WinResult<(DeviceType, InterfaceType)> {
 		let aeff = self.0
 			.Lookup(&to_aqs(&PKEY_AudioEndpoint_FormFactor))?
 			.cast::<IPropertyValue>()?
 			.GetInt32()?
 			.pipe(EndpointFormFactor);
-		
-		#[deny(nonstandard_style, reason = "typos would silently turn these into wildcard patterns")]
+
+		// InterfaceType::BuiltIn => todo!(),
+		// InterfaceType::Usb => todo!(),
+		// InterfaceType::Bluetooth => todo!(),
+		// InterfaceType::Pci => todo!(),
+		// InterfaceType::FireWire => todo!(),
+		// InterfaceType::Thunderbolt => todo!(),
+		// InterfaceType::Hdmi => todo!(),
+		// InterfaceType::Line => todo!(),
+		// InterfaceType::Spdif => todo!(),
+		// InterfaceType::Network => todo!(),
+		// InterfaceType::Virtual => todo!(),
+		// InterfaceType::DisplayPort => todo!(),
+		// InterfaceType::Aggregate => todo!(),
+		// InterfaceType::Unknown => todo!(),
+
+		#[deny(nonstandard_style, reason = "prevent accidental wildcards")]
 		#[expect(unused_qualifications, reason = "rustc bug?")]
 		#[expect(clippy::match_same_arms, reason = "happenstance")]
 		match aeff {
-			Audio::RemoteNetworkDevice       => DeviceType::Unknown,
-			Audio::Speakers                  => DeviceType::Speaker,
-			Audio::LineLevel                 => DeviceType::Unknown,
-			Audio::Headphones                => DeviceType::Headphones,
-			Audio::Microphone                => DeviceType::Microphone,
-			Audio::Headset                   => DeviceType::Headset,
-			Audio::Handset                   => DeviceType::Handset,
-			Audio::UnknownDigitalPassthrough => DeviceType::Unknown,
-			Audio::SPDIF                     => DeviceType::Unknown,
-			Audio::DigitalAudioDisplayDevice => DeviceType::Unknown,
-			Audio::UnknownFormFactor         => DeviceType::Unknown,
-			_                                => DeviceType::Unknown
+			Audio::Speakers                  => (DeviceType::Speaker   , InterfaceType::Unknown),
+			Audio::Headphones                => (DeviceType::Headphones, InterfaceType::Unknown),
+			Audio::Microphone                => (DeviceType::Microphone, InterfaceType::Unknown),
+			Audio::Headset                   => (DeviceType::Headset   , InterfaceType::Unknown),
+			Audio::Handset                   => (DeviceType::Handset   , InterfaceType::Unknown),
+			Audio::RemoteNetworkDevice       => (DeviceType::Unknown   , InterfaceType::Network),
+			Audio::LineLevel                 => (DeviceType::Unknown   , InterfaceType::Line),
+			Audio::SPDIF                     => (DeviceType::Unknown   , InterfaceType::Spdif),
+			Audio::DigitalAudioDisplayDevice => (DeviceType::Unknown   , InterfaceType::DisplayPort),
+			Audio::UnknownDigitalPassthrough => (DeviceType::Unknown   , InterfaceType::Unknown),
+			Audio::UnknownFormFactor         => (DeviceType::Unknown   , InterfaceType::Unknown),
+			_                                => (DeviceType::Unknown   , InterfaceType::Unknown)
 		}
 		.pipe(Ok)
 	}
