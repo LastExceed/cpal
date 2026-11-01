@@ -22,19 +22,19 @@ mod processing;
 mod device;
 mod utils;
 
-type Devices = vec::IntoIter<Device>;
 type SupportedConfigs = vec::IntoIter<SupportedStreamConfigRange>;
 
 pub struct Host;
 
 impl Host {
+	#[expect(clippy::unnecessary_wraps, reason = "required by the `impl_platform_host` macro")]
 	pub const fn new() -> Result<Self, Error> {
 		Ok(Self)
 	}
 }
 
 impl HostTrait for Host {
-	type Devices = device::Devices;
+	type Devices = vec::IntoIter<Device>;
 	type Device = Device;
 
 	fn is_available() -> bool {
@@ -42,7 +42,12 @@ impl HostTrait for Host {
 	}
 
 	fn devices(&self) -> Result<Self::Devices, Error> {
-		device::all().map_err(convert_error)
+		device::all()
+			.map_err(convert_error)?
+			.map(Device)
+			.collect::<Vec<_>>()
+    		.into_iter()
+			.pipe(Ok)
 	}
 
 	fn default_input_device(&self) -> Option<Self::Device> {
@@ -80,19 +85,24 @@ impl Display for Device {
 impl Device {
 	fn description_inner(&self) -> WinResult<DeviceDescription> {
 		let name = self.0.Name()?.to_string_lossy();
-		let facade = device::Facade(self.0.Properties()?);
-		let (device_type, interface_type) = facade.kind()?;
+		let reader = device::PropertyReader(self.0.Properties()?);
+		let (device_type, interface_type) = reader.types()?;
 		
-		DeviceDescriptionBuilder
+		let mut builder = DeviceDescriptionBuilder
 			::new(name.clone())
     		.driver(name)
     		// .direction(todo!())
+			// .manufacturer(manufacturer)
     		.device_type(device_type)
-    		.interface_type(interface_type)
-			.build()
-			.pipe(Ok)
+    		.interface_type(interface_type);
+    		
+		if let Some(physical_location) = reader.physical_location()? {
+			builder = builder.address(physical_location);
+		}
+			
+		Ok(builder.build())
 	}
-	
+
 	fn mm_device(&self) -> Result<MMDevice, WasapiError> {
 		let enumerator = DeviceEnumerator::new()?;
 		self.0
@@ -110,10 +120,10 @@ impl Device {
 		
 		SupportedStreamConfig {
 			channels: waveformat.get_nchannels(),
-			sample_rate: waveformat.get_samplespersec(), // misleading name, should be framespersec
+			sample_rate: waveformat.get_samplespersec(),
 			buffer_size: SupportedBufferSize::default(),
 			sample_format: match waveformat.get_validbitspersample() {
-					8 => SampleFormat::I8,
+				 8 => SampleFormat::I8,
 				16 => SampleFormat::I16,
 				24 => SampleFormat::I24,
 				32 if waveformat.get_subformat()? == SampleType::Float => SampleFormat::F32,
@@ -123,7 +133,7 @@ impl Device {
 		}.pipe(Ok)
 	}
 
-	fn configs(&self, direction: Direction) -> Result<SupportedConfigs, WasapiError> {
+	fn supported_configs(&self, direction: Direction) -> Result<SupportedConfigs, WasapiError> {
 		use SampleFormat::*;
 		
 		let mm_device = self.mm_device()?;
@@ -139,7 +149,7 @@ impl Device {
 			.into_iter()
 			.flat_map(move |range| 
 				COMMON_SAMPLE_RATES
-				.into_iter()
+				.iter()
 				.copied()
 				.skip_while(move |rate| *rate < range.min_samplerate)
 				.take_while(move |rate| *rate <= range.max_samplerate)
@@ -275,12 +285,12 @@ impl DeviceTrait for Device {
 	}
 
 	fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
-		self.configs(Direction::Capture)
+		self.supported_configs(Direction::Capture)
 			.map_err(convert_error)
 	}
 
 	fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
-		self.configs(Direction::Render)
+		self.supported_configs(Direction::Render)
 			.map_err(convert_error)
 	}
 
@@ -439,8 +449,7 @@ impl StreamInner {
 		self.last_hns = self
 			.audio_clock
 			.get_position()
-			.map(|(_pos, hns)| hns)
-			.unwrap_or(u64::MIN)
+			.map_or(u64::MIN, |(_pos, hns)| hns)
 			.max(self.last_hns);
 		
 		StreamInstant::from_nanos(self.last_hns * 100)

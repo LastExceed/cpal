@@ -77,16 +77,11 @@ impl Drop for ScratchBuffer {
 	}
 }
 
+#[derive(Debug)]
 pub struct Event(HANDLE);
 
 unsafe impl Send for Event {}
 unsafe impl Sync for Event {}
-
-impl Debug for Event {
-	fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		todo!()
-	}
-}
 
 impl Event {
 	pub fn new() -> WinResult<Self> {
